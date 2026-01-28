@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+
+# PyInstaller outputs
+build/
+dist/
+*.spec
+
+# OS / editor junk
+Thumbs.db
+.DS_Store
+.vscode/
