@@ -1,10 +1,12 @@
 import sys
 import time
+import math
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtMultimedia import QSoundEffect
 
 import win32gui
 import win32process
@@ -15,25 +17,27 @@ from pynput import keyboard, mouse
 
 
 # -----------------------------
-# App icon handling (dev + PyInstaller onefile)
+# Resources (dev + PyInstaller onefile)
 # -----------------------------
 def resource_path(rel: str) -> str:
-    """
-    Returns an absolute path to a resource file.
-    Works in development and when bundled with PyInstaller (--onefile).
-    """
     base = getattr(sys, "_MEIPASS", str(Path(__file__).resolve().parent))
     return str(Path(base) / rel)
 
 
-APP_ICON_REL = "assets/waxy.ico"  # <-- Put your .ico here (relative to this .py)
+APP_ICON_REL = "assets/waxy.ico"
 APP_ICON_PATH = resource_path(APP_ICON_REL)
+
+SOUNDS_DIR_REL = "assets/sounds"
+SOUNDS_DIR_PATH = Path(resource_path(SOUNDS_DIR_REL))
+
+DEFAULT_SOUND_FILE = "town_crier_ring_bell_down.wav"
+DEFAULT_SOUND_THRESHOLD = 15
 
 
 def set_windows_app_user_model_id(app_id: str):
-    # Helps Windows show the correct taskbar icon/grouping.
     try:
         import ctypes
+
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except Exception:
         pass
@@ -60,7 +64,6 @@ def _is_real_window(hwnd: int) -> bool:
     title = win32gui.GetWindowText(hwnd).strip()
     if not title:
         return False
-    # Best-effort skip tool windows
     try:
         ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
         WS_EX_TOOLWINDOW = 0x00000080
@@ -72,7 +75,6 @@ def _is_real_window(hwnd: int) -> bool:
 
 
 def _get_exe_name_for_hwnd(hwnd: int) -> str:
-    """Best-effort. Returns lowercase exe name (e.g. 'chrome.exe') or ''."""
     try:
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         if not pid:
@@ -101,11 +103,9 @@ def _get_exe_name_for_hwnd(hwnd: int) -> str:
 def _window_allowed(hwnd: int, title: str) -> bool:
     tl = title.strip().lower()
 
-    # Allow the actual game window by title match
     if "2004scape game" in tl:
         return True
 
-    # Allow browser windows by exe name
     exe = _get_exe_name_for_hwnd(hwnd)
     if exe in BROWSER_EXES:
         return True
@@ -133,16 +133,11 @@ def get_foreground_window():
 
 
 def hwnd_is_target_or_child(clicked_hwnd: int, target_hwnd: int) -> bool:
-    """
-    Check whether clicked_hwnd is the target window or belongs to it.
-    Uses parent-walk and a more reliable root-ancestor check.
-    """
     if not clicked_hwnd or not target_hwnd:
         return False
     if clicked_hwnd == target_hwnd:
         return True
 
-    # Parent chain
     cur = clicked_hwnd
     while cur:
         try:
@@ -152,7 +147,6 @@ def hwnd_is_target_or_child(clicked_hwnd: int, target_hwnd: int) -> bool:
         if cur == target_hwnd:
             return True
 
-    # Root ancestor check (helps with many modern windows/surfaces)
     try:
         GA_ROOT = 2
         clicked_root = win32gui.GetAncestor(clicked_hwnd, GA_ROOT)
@@ -171,8 +165,11 @@ def hwnd_is_target_or_child(clicked_hwnd: int, target_hwnd: int) -> bool:
 @dataclass
 class TimerConfig:
     length_seconds: int = 90
-    threshold_seconds: int = 15  # default for 90s
-    count_below_zero: bool = True  # default ON
+    threshold_seconds: int = 15
+    count_below_zero: bool = True
+
+    sound_threshold_seconds: int = DEFAULT_SOUND_THRESHOLD
+    sound_file_rel: str = ""
 
 
 class ActivityTimer(QtCore.QObject):
@@ -207,12 +204,6 @@ class ActivityTimer(QtCore.QObject):
 # Global hooks
 # -----------------------------
 class InputHookController(QtCore.QObject):
-    """
-    Rules:
-      - Count keystrokes only if target window is foreground.
-      - Count mouse clicks only if click lands inside target window or its child.
-      - Ignore mouse move and wheel.
-    """
     def __init__(self, timer: ActivityTimer):
         super().__init__()
         self.timer = timer
@@ -241,7 +232,6 @@ class InputHookController(QtCore.QObject):
         except Exception:
             pass
 
-        # Best effort join
         try:
             if self._thread and self._thread.is_alive():
                 self._thread.join(timeout=1.0)
@@ -292,9 +282,7 @@ class MiniOverlay(QtWidgets.QWidget):
     def __init__(self, app_icon: QtGui.QIcon | None = None):
         super().__init__()
         self.setWindowFlags(
-            QtCore.Qt.Tool |
-            QtCore.Qt.FramelessWindowHint |
-            QtCore.Qt.WindowStaysOnTopHint
+            QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint
         )
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
 
@@ -306,9 +294,7 @@ class MiniOverlay(QtWidgets.QWidget):
         self.display = QtWidgets.QLCDNumber()
         self.display.setSegmentStyle(QtWidgets.QLCDNumber.Flat)
         self.display.setDigitCount(5)
-        self.display.setStyleSheet("""
-            QLCDNumber { background: transparent; color: #33ff66; }
-        """)
+        self.display.setStyleSheet("QLCDNumber { background: transparent; color: #33ff66; }")
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -321,7 +307,7 @@ class MiniOverlay(QtWidgets.QWidget):
         grip_row.addWidget(self.grip, 0, QtCore.Qt.AlignBottom | QtCore.Qt.AlignRight)
         layout.addLayout(grip_row)
 
-        self.setMinimumSize(140, 60)
+        self.setMinimumSize(160, 70)
 
     def set_time_text(self, text: str, danger: bool, digit_count: int):
         self.display.setDigitCount(digit_count)
@@ -373,12 +359,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.overlay = MiniOverlay(app_icon=self._app_icon)
         self.overlay.restore_requested.connect(self._restore_from_miniplayer)
 
-        self.setWindowTitle("waxy timer")
-        self.resize(820, 360)
-        self.setMinimumSize(720, 260)
+        # Sound
+        self._sound = QSoundEffect(self)
+        self._sound.setLoopCount(1)
+        self._sound.setVolume(0.9)
+        self._sound_fired = False
+        self._last_remaining = None
 
-        # Win98-ish style + readable inputs; toolbuttons sized in code (responsive)
-        self.setStyleSheet("""
+        # Avoid restore-click re-opening miniplayer
+        self._suppress_miniplayer_until = 0.0
+
+        self.setWindowTitle("waxy timer")
+
+        # Smaller overall window so left panel fills better
+        self.resize(760, 300)
+        self.setMinimumSize(700, 285)
+
+        self.setStyleSheet(
+            """
             QMainWindow { background: #c0c0c0; }
 
             QFrame#settingsPanel, QFrame#timerPanel {
@@ -387,7 +385,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 border-radius: 8px;
             }
 
+            /* Match splitter handle to window bg so you don't get the light stripe. */
+            QSplitter::handle { background: #c0c0c0; }
+            QSplitter::handle:horizontal { width: 12px; }
+
             QLabel { color: #000; font-family: Segoe UI; }
+            QCheckBox { font-family: Segoe UI; }
 
             QComboBox, QLineEdit {
                 color: #000;
@@ -410,20 +413,21 @@ class MainWindow(QtWidgets.QMainWindow):
             QToolButton {
                 background: #e6e6e6;
                 border: 2px outset #a9a9a9;
-                padding: 0px;
                 font-weight: 900;
             }
             QToolButton:pressed { border: 2px inset #a9a9a9; }
             QToolButton:focus { outline: none; }
-        """)
+            """
+        )
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
+        root.setContentsMargins(8, 8, 8, 8)
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(12)
         root.addWidget(self.splitter, 1)
 
         # -------- Left panel --------
@@ -433,54 +437,100 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splitter.addWidget(settings_panel)
 
         s_layout = QtWidgets.QVBoxLayout(settings_panel)
-        s_layout.setContentsMargins(12, 12, 12, 12)
-        s_layout.setSpacing(10)
+        s_layout.setContentsMargins(14, 10, 14, 10)
+        s_layout.setSpacing(9)
 
-        s_layout.addWidget(QtWidgets.QLabel("Target window"))
+        # Target window row
         window_row = QtWidgets.QHBoxLayout()
-        window_row.setSpacing(8)
+        window_row.setSpacing(10)
 
         self.window_combo = QtWidgets.QComboBox()
         self.window_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.window_combo.setMinimumWidth(240)
 
         self.refresh_btn = QtWidgets.QToolButton()
         self.refresh_btn.setText("⟳")
         self.refresh_btn.setToolTip("Refresh window list")
         self.refresh_btn.clicked.connect(self._refresh_windows)
+        self.refresh_btn.setFixedSize(40, 40)
 
         window_row.addWidget(self.window_combo, 1)
         window_row.addWidget(self.refresh_btn, 0)
         s_layout.addLayout(window_row)
 
-        s_layout.addWidget(QtWidgets.QLabel("Timer length"))
+        # Timer length
         self.length_combo = QtWidgets.QComboBox()
         self.length_combo.addItem("90 seconds", 90)
         self.length_combo.addItem("10 minutes", 600)
         self.length_combo.currentIndexChanged.connect(self._on_length_changed)
         s_layout.addWidget(self.length_combo)
 
+        # Below zero
         self.below_zero_chk = QtWidgets.QCheckBox("Count below zero")
         self.below_zero_chk.stateChanged.connect(self._on_below_zero_changed)
         s_layout.addWidget(self.below_zero_chk)
 
-        s_layout.addWidget(QtWidgets.QLabel("Turn red at (seconds remaining)"))
+        # Thresholds: still uniform, but slightly smaller so they “fill” nicely
+        THRESH_W = 104
+        THRESH_H = 30
+
+        thresh_row = QtWidgets.QHBoxLayout()
+        thresh_row.setContentsMargins(0, 0, 0, 0)
+        thresh_row.setSpacing(16)
+
+        red_group = QtWidgets.QVBoxLayout()
+        red_group.setContentsMargins(0, 0, 0, 0)
+        red_group.setSpacing(6)
+        lbl_red = QtWidgets.QLabel("Turn red at")
+        lbl_red.setAlignment(QtCore.Qt.AlignHCenter)
+
         self.threshold_edit = QtWidgets.QLineEdit()
-        self.threshold_edit.setPlaceholderText("e.g. 15")
+        self.threshold_edit.setFixedSize(THRESH_W, THRESH_H)
+        self.threshold_edit.setAlignment(QtCore.Qt.AlignHCenter)
         self.threshold_edit.editingFinished.connect(self._on_threshold_changed)
-        s_layout.addWidget(self.threshold_edit)
 
-        s_layout.addStretch(1)
+        red_group.addWidget(lbl_red, 0)
+        red_group.addWidget(self.threshold_edit, 0, QtCore.Qt.AlignHCenter)
 
-        # ---- bottom row: miniplayer button on RIGHT ----
-        bottom_row = QtWidgets.QHBoxLayout()
-        bottom_row.addStretch(1)
-        self.miniplayer_btn = QtWidgets.QToolButton()
-        self.miniplayer_btn.setText("▣")
-        self.miniplayer_btn.setToolTip("Miniplayer")
-        self.miniplayer_btn.clicked.connect(self._enter_miniplayer)
-        bottom_row.addWidget(self.miniplayer_btn, 0, QtCore.Qt.AlignRight)
-        s_layout.addLayout(bottom_row)
+        sound_group = QtWidgets.QVBoxLayout()
+        sound_group.setContentsMargins(0, 0, 0, 0)
+        sound_group.setSpacing(6)
+        lbl_sound_thr = QtWidgets.QLabel("Play sound at")
+        lbl_sound_thr.setAlignment(QtCore.Qt.AlignHCenter)
+
+        self.sound_threshold_edit = QtWidgets.QLineEdit()
+        self.sound_threshold_edit.setFixedSize(THRESH_W, THRESH_H)
+        self.sound_threshold_edit.setAlignment(QtCore.Qt.AlignHCenter)
+        self.sound_threshold_edit.editingFinished.connect(self._on_sound_threshold_changed)
+
+        sound_group.addWidget(lbl_sound_thr, 0)
+        sound_group.addWidget(self.sound_threshold_edit, 0, QtCore.Qt.AlignHCenter)
+
+        thresh_row.addStretch(1)
+        thresh_row.addLayout(red_group)
+        thresh_row.addLayout(sound_group)
+        thresh_row.addStretch(1)
+        s_layout.addLayout(thresh_row)
+
+        # Sound dropdown + play button
+        sound_row = QtWidgets.QHBoxLayout()
+        sound_row.setSpacing(10)
+
+        self.sound_combo = QtWidgets.QComboBox()
+        self.sound_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.sound_combo.currentIndexChanged.connect(self._on_sound_selection_changed)
+
+        self.sound_play_btn = QtWidgets.QToolButton()
+        self.sound_play_btn.setText("▶")
+        self.sound_play_btn.setToolTip("Play selected sound")
+        self.sound_play_btn.clicked.connect(self._play_selected_sound_sample)
+        self.sound_play_btn.setFixedSize(40, 40)
+
+        sound_row.addWidget(self.sound_combo, 1)
+        sound_row.addWidget(self.sound_play_btn, 0)
+        s_layout.addLayout(sound_row)
+
+        # Make the left panel feel “filled” by spacing bottom less
+        s_layout.addStretch(0)
 
         # -------- Right panel --------
         timer_panel = QtWidgets.QFrame()
@@ -488,18 +538,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splitter.addWidget(timer_panel)
 
         t_layout = QtWidgets.QVBoxLayout(timer_panel)
-        t_layout.setContentsMargins(12, 12, 12, 12)
-        t_layout.setSpacing(12)
+        t_layout.setContentsMargins(14, 10, 14, 10)
+        t_layout.setSpacing(8)
 
+        hint = QtWidgets.QLabel("Right-click timer box to activate miniplayer • Right-click miniplayer to restore")
+        hint.setStyleSheet("QLabel { color: #222; font-size: 10px; }")
+        hint.setWordWrap(True)
+        t_layout.addWidget(hint, 0)
+
+        # Scale timer down with the overall UI
         self.timer_box = QtWidgets.QFrame()
-        self.timer_box.setStyleSheet("""
+        self.timer_box.setStyleSheet(
+            """
             QFrame {
                 background: #000;
                 border: 2px inset #3a3a3a;
                 border-radius: 10px;
             }
-        """)
-        # Right-click timer box opens miniplayer
+            """
+        )
         self.timer_box.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.timer_box.customContextMenuRequested.connect(lambda _pos: self._enter_miniplayer())
 
@@ -508,77 +565,160 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.timer_display = QtWidgets.QLCDNumber()
         self.timer_display.setSegmentStyle(QtWidgets.QLCDNumber.Flat)
-        self.timer_display.setDigitCount(3)  # 90s mode default
+        self.timer_display.setDigitCount(3)
         self.timer_display.setStyleSheet("QLCDNumber { background: transparent; color: #33ff66; }")
-        self.timer_display.setMinimumHeight(140)
+        self.timer_display.setMinimumHeight(135)  # smaller so it fits cleanly at smaller window size
         box_layout.addWidget(self.timer_display, 1)
 
         t_layout.addWidget(self.timer_box, 1)
 
-        # Keep sides proportional
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 1)
 
-        # Populate targets then load saved settings (which may reselect)
+        # Populate then load settings
         self._refresh_windows()
+        self._populate_sound_list()
         self._load_persistent_state()
 
         self.timer_model.reset_to_full()
+        self._rearm_sound()
 
         self.ui_timer = QtCore.QTimer(self)
         self.ui_timer.timeout.connect(self._tick_ui)
         self.ui_timer.start(100)
 
-        self._apply_responsive_sizes()
         self._tick_ui()
+
+    # ---------------- Sound helpers ----------------
+    def _available_wavs(self) -> list[Path]:
+        try:
+            if SOUNDS_DIR_PATH.exists() and SOUNDS_DIR_PATH.is_dir():
+                return sorted(
+                    [p for p in SOUNDS_DIR_PATH.glob("*.wav") if p.is_file()],
+                    key=lambda p: p.name.lower(),
+                )
+        except Exception:
+            pass
+        return []
+
+    def _populate_sound_list(self):
+        self.sound_combo.blockSignals(True)
+        self.sound_combo.clear()
+
+        wavs = self._available_wavs()
+        if not wavs:
+            self.sound_combo.addItem("None (no .wav found)", "")
+        else:
+            self.sound_combo.addItem("None", "")
+            for p in wavs:
+                self.sound_combo.addItem(p.stem, p.name)
+
+        self.sound_combo.blockSignals(False)
+
+    def _set_sound_by_relname(self, rel_name: str):
+        rel_name = (rel_name or "").strip()
+        if not rel_name:
+            self._sound.setSource(QtCore.QUrl())
+            self.timer_model.config.sound_file_rel = ""
+            return
+
+        rel_name = Path(rel_name).name
+        full = (SOUNDS_DIR_PATH / rel_name).resolve()
+        if not full.exists():
+            self._sound.setSource(QtCore.QUrl())
+            self.timer_model.config.sound_file_rel = ""
+            return
+
+        self.timer_model.config.sound_file_rel = rel_name
+        self._sound.setSource(QtCore.QUrl.fromLocalFile(str(full)))
+
+    def _play_sound_once(self):
+        try:
+            if self._sound.source().isEmpty():
+                return
+            self._sound.play()
+        except Exception:
+            pass
+
+    def _play_selected_sound_sample(self):
+        try:
+            rel_name = self.sound_combo.currentData() or ""
+            self._set_sound_by_relname(rel_name)
+            self._play_sound_once()
+        except Exception:
+            pass
+
+    def _rearm_sound(self):
+        self._sound_fired = False
 
     # ---------------- Persistence ----------------
     def _load_persistent_state(self):
-        # Geometry
         geo = self.settings.value("main/geometry", None)
         if isinstance(geo, QtCore.QByteArray):
             self.restoreGeometry(geo)
 
-        # Splitter sizes
         s = self.settings.value("main/splitter", None)
         if isinstance(s, QtCore.QByteArray):
             self.splitter.restoreState(s)
         else:
-            self.splitter.setSizes([360, 460])
+            self.splitter.setSizes([350, 400])
 
-        # Timer length
         length = self.settings.value("config/length_seconds", 90, int)
-        idx = 0 if int(length) == 90 else 1
-        self.length_combo.setCurrentIndex(idx)
+        self.length_combo.setCurrentIndex(0 if int(length) == 90 else 1)
         self.timer_model.config.length_seconds = int(self.length_combo.currentData())
 
-        # Count below zero (DEFAULT TRUE if never saved)
         below = self.settings.value("config/count_below_zero", True)
         if isinstance(below, str):
             below = below.strip().lower() in ("1", "true", "yes", "on")
         self.below_zero_chk.setChecked(bool(below))
         self.timer_model.config.count_below_zero = bool(below)
 
-        # Threshold (if never saved, use defaults by length)
         saved_thr = self.settings.value("config/threshold_seconds", None)
         if saved_thr is None:
-            self._apply_default_threshold_for_length(self.timer_model.config.length_seconds)
+            self.timer_model.config.threshold_seconds = 15 if int(self.timer_model.config.length_seconds) == 90 else 60
         else:
             try:
                 self.timer_model.config.threshold_seconds = max(0, int(saved_thr))
             except Exception:
-                self._apply_default_threshold_for_length(self.timer_model.config.length_seconds)
+                self.timer_model.config.threshold_seconds = 15
         self.threshold_edit.setText(str(self.timer_model.config.threshold_seconds))
 
-        # Preferred window hint
-        self._preferred_window_hint = self.settings.value(
-            "config/preferred_window_hint", "2004scape game"
-        )
-        if not isinstance(self._preferred_window_hint, str):
-            self._preferred_window_hint = "2004scape game"
-        self._preferred_window_hint = self._preferred_window_hint.lower()
+        has_saved_sound_thr = self.settings.contains("config/sound_threshold_seconds")
+        saved_sound_thr = self.settings.value("config/sound_threshold_seconds", None)
+        if not has_saved_sound_thr or saved_sound_thr is None:
+            self.timer_model.config.sound_threshold_seconds = DEFAULT_SOUND_THRESHOLD
+        else:
+            try:
+                self.timer_model.config.sound_threshold_seconds = max(0, int(saved_sound_thr))
+            except Exception:
+                self.timer_model.config.sound_threshold_seconds = DEFAULT_SOUND_THRESHOLD
+        self.sound_threshold_edit.setText(str(self.timer_model.config.sound_threshold_seconds))
 
-        # Choose target (game first)
+        has_saved_sound = self.settings.contains("config/sound_file_rel")
+        saved_sound_file = self.settings.value("config/sound_file_rel", "")
+        if not isinstance(saved_sound_file, str):
+            saved_sound_file = ""
+        saved_sound_file = saved_sound_file.strip()
+
+        if not has_saved_sound:
+            if (SOUNDS_DIR_PATH / DEFAULT_SOUND_FILE).exists():
+                saved_sound_file = DEFAULT_SOUND_FILE
+            else:
+                saved_sound_file = ""
+
+        selected_idx = 0
+        for i in range(self.sound_combo.count()):
+            if (self.sound_combo.itemData(i) or "") == saved_sound_file:
+                selected_idx = i
+                break
+        self.sound_combo.setCurrentIndex(selected_idx)
+        self._set_sound_by_relname(self.sound_combo.currentData() or "")
+
+        hint = self.settings.value("config/preferred_window_hint", "2004scape game")
+        if not isinstance(hint, str):
+            hint = "2004scape game"
+        self._preferred_window_hint = hint.lower()
+
         self._select_best_default_target()
 
     def _save_persistent_state(self):
@@ -589,7 +729,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("config/count_below_zero", bool(self.timer_model.config.count_below_zero))
         self.settings.setValue("config/threshold_seconds", int(self.timer_model.config.threshold_seconds))
 
-        # Save a hint so we can reselect on next launch
+        self.settings.setValue("config/sound_threshold_seconds", int(self.timer_model.config.sound_threshold_seconds))
+        self.settings.setValue("config/sound_file_rel", str(self.timer_model.config.sound_file_rel or ""))
+
         cur_title = self.window_combo.currentText().strip().lower()
         if "2004scape game" in cur_title and not any(
             b in cur_title for b in ("chrome", "edge", "firefox", "brave", "opera", "vivaldi")
@@ -600,16 +742,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.settings.sync()
 
-    # ---------------- Target window selection ----------------
+    # ---------------- Target selection ----------------
     def _refresh_windows(self):
         current_hwnd = int(self.window_combo.currentData()) if self.window_combo.currentData() else 0
 
         self.window_combo.blockSignals(True)
         self.window_combo.clear()
 
-        windows = list_target_windows()
-        for hwnd, title in windows:
-            # Show ONLY the window title (no hex handle)
+        for hwnd, title in list_target_windows():
             self.window_combo.addItem(title, int(hwnd))
 
         self.window_combo.blockSignals(False)
@@ -620,7 +760,6 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.window_combo.currentIndexChanged.connect(self._on_target_changed)
 
-        # Keep current hwnd if still present
         if current_hwnd:
             for i in range(self.window_combo.count()):
                 if int(self.window_combo.itemData(i)) == current_hwnd:
@@ -628,7 +767,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.timer_model.set_target_hwnd(current_hwnd)
                     return
 
-        # Otherwise choose default
         self._select_best_default_target()
 
     def _select_best_default_target(self):
@@ -638,7 +776,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         best_idx = None
 
-        # Priority 1: actual "2004Scape Game" that is NOT obviously a browser window
         for i in range(self.window_combo.count()):
             title = self.window_combo.itemText(i).lower()
             if "2004scape game" in title and not any(
@@ -647,7 +784,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 best_idx = i
                 break
 
-        # Priority 2: user preference hint
         if best_idx is None and getattr(self, "_preferred_window_hint", ""):
             hint = self._preferred_window_hint
             for i in range(self.window_combo.count()):
@@ -655,7 +791,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     best_idx = i
                     break
 
-        # Priority 3: any 2004scape-related window (including browser tab)
         if best_idx is None:
             for i in range(self.window_combo.count()):
                 if "2004scape game" in self.window_combo.itemText(i).lower():
@@ -673,91 +808,75 @@ class MainWindow(QtWidgets.QMainWindow):
         hwnd = int(self.window_combo.currentData()) if self.window_combo.currentData() else 0
         self.timer_model.set_target_hwnd(hwnd)
         self.timer_model.reset_to_full()
+        self._rearm_sound()
 
-    # ---------------- Settings handlers ----------------
-    def _apply_default_threshold_for_length(self, length_seconds: int):
-        self.timer_model.config.threshold_seconds = 15 if int(length_seconds) == 90 else 60
-        self.threshold_edit.setText(str(self.timer_model.config.threshold_seconds))
-
+    # ---------------- Handlers ----------------
     def _on_length_changed(self, _idx):
         length = int(self.length_combo.currentData())
         self.timer_model.config.length_seconds = length
         self.timer_model.reset_to_full()
-        # Default thresholds: 90s -> 15, 10m -> 60
-        self._apply_default_threshold_for_length(length)
+        self._rearm_sound()
+
+        self.timer_model.config.threshold_seconds = 15 if length == 90 else 60
+        self.threshold_edit.setText(str(self.timer_model.config.threshold_seconds))
 
     def _on_below_zero_changed(self, _state):
         self.timer_model.config.count_below_zero = self.below_zero_chk.isChecked()
 
     def _on_threshold_changed(self):
-        text = self.threshold_edit.text().strip()
         try:
-            val = int(float(text))
-            val = max(0, val)
+            val = max(0, int(float(self.threshold_edit.text().strip())))
             self.timer_model.config.threshold_seconds = val
             self.threshold_edit.setText(str(val))
         except Exception:
             self.threshold_edit.setText(str(self.timer_model.config.threshold_seconds))
 
+    def _on_sound_threshold_changed(self):
+        try:
+            val = max(0, int(float(self.sound_threshold_edit.text().strip())))
+            self.timer_model.config.sound_threshold_seconds = val
+            self.sound_threshold_edit.setText(str(val))
+            self._rearm_sound()
+        except Exception:
+            self.sound_threshold_edit.setText(str(self.timer_model.config.sound_threshold_seconds))
+
+    def _on_sound_selection_changed(self, _idx):
+        rel_name = self.sound_combo.currentData() or ""
+        self._set_sound_by_relname(rel_name)
+        self._rearm_sound()
+
     # ---------------- Miniplayer ----------------
     def _enter_miniplayer(self):
-        # Size the miniplayer to match the timer box size
+        if time.time() < self._suppress_miniplayer_until:
+            return
+
         size = self.timer_box.size()
         if size.width() > 0 and size.height() > 0:
             self.overlay.resize(size)
 
-        # Position near top-right of main window
         main_geo = self.geometry()
-        self.overlay.move(
-            main_geo.x() + main_geo.width() - self.overlay.width() - 20,
-            main_geo.y() + 40
-        )
+        self.overlay.move(main_geo.x() + main_geo.width() - self.overlay.width() - 20, main_geo.y() + 40)
 
         self.overlay.show()
         self.hide()
 
     def _restore_from_miniplayer(self):
+        self._suppress_miniplayer_until = time.time() + 0.35
         self.overlay.hide()
         self.show()
         self.activateWindow()
 
-    # ---------------- Responsive sizing ----------------
-    def _apply_responsive_sizes(self):
-        # Scale buttons based on left panel width
-        try:
-            left_w = self.splitter.sizes()[0]
-        except Exception:
-            left_w = 360
-
-        # Button edge length + glyph size; clamp so it never gets absurd
-        btn = max(28, min(52, int(left_w * 0.13)))
-        fsz = max(16, min(34, int(btn * 0.62)))
-
-        # Apply to toolbuttons
-        for b in (self.refresh_btn, self.miniplayer_btn):
-            b.setFixedSize(btn, btn)
-            f = b.font()
-            f.setPointSize(fsz)
-            b.setFont(f)
-
-        # Refresh symbol looks better slightly smaller than the miniplayer symbol
-        f = self.refresh_btn.font()
-        f.setPointSize(max(14, fsz - 3))
-        self.refresh_btn.setFont(f)
-
-    def resizeEvent(self, event: QtGui.QResizeEvent):
-        super().resizeEvent(event)
-        self._apply_responsive_sizes()
-
     # ---------------- Time formatting + draw ----------------
+    def _quantize_seconds_for_display(self, seconds: float) -> int:
+        if seconds > 0:
+            return int(math.ceil(seconds))
+        if seconds < 0:
+            return -int(math.ceil(abs(seconds)))
+        return 0
+
     def _format_time(self, seconds: float) -> tuple[str, int]:
-        """
-        Returns (text, digit_count).
-          - length == 90: show seconds-only (90..0..-12)
-          - else: show MM:SS
-        """
         neg = seconds < 0
-        s = int(seconds)
+        s = self._quantize_seconds_for_display(seconds)
         abs_s = abs(s)
 
         if int(self.timer_model.config.length_seconds) == 90:
@@ -776,27 +895,36 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _tick_ui(self):
         remaining = float(self.timer_model.remaining_seconds())
-        danger = remaining <= float(self.timer_model.config.threshold_seconds)
 
+        if self._last_remaining is not None and remaining > (self._last_remaining + 0.75):
+            self._rearm_sound()
+
+        sound_thr = float(self.timer_model.config.sound_threshold_seconds)
+        if not self._sound_fired and self._last_remaining is not None:
+            if (self._last_remaining > sound_thr) and (remaining <= sound_thr):
+                self._play_sound_once()
+                self._sound_fired = True
+
+        self._last_remaining = remaining
+
+        danger = remaining <= float(self.timer_model.config.threshold_seconds)
         text, digits = self._format_time(remaining)
 
-        # Main display digit count
         if int(self.timer_model.config.length_seconds) == 90:
             self.timer_display.setDigitCount(max(3, digits))
         else:
             self.timer_display.setDigitCount(6 if text.startswith("-") else 5)
 
         self.timer_display.display(text)
-
         color = "#ff3b30" if danger else "#33ff66"
         self.timer_display.setStyleSheet(f"QLCDNumber {{ background: transparent; color: {color}; }}")
 
-        # Overlay display if visible
         if self.overlay.isVisible():
-            if int(self.timer_model.config.length_seconds) == 90:
-                overlay_digits = max(3, digits)
-            else:
-                overlay_digits = 6 if text.startswith("-") else 5
+            overlay_digits = (
+                max(3, digits)
+                if int(self.timer_model.config.length_seconds) == 90
+                else (6 if text.startswith("-") else 5)
+            )
             self.overlay.set_time_text(text, danger, overlay_digits)
 
     # ---------------- Close ----------------
@@ -822,7 +950,6 @@ def main():
     set_windows_app_user_model_id("Waxy.WaxyTimer")
 
     app = QtWidgets.QApplication(sys.argv)
-
     icon = QtGui.QIcon(APP_ICON_PATH) if APP_ICON_PATH else QtGui.QIcon()
     if icon and not icon.isNull():
         app.setWindowIcon(icon)

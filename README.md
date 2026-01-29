@@ -1,65 +1,74 @@
 # Waxy Timer
 
-Waxy Timer is a lightweight Windows utility that tracks user activity in a specific
-target window (such as 2004Scape Game or a browser window) and automatically resets
-a configurable countdown timer when activity is detected.
+**Waxy Timer** is a lightweight Windows utility that tracks mouse clicks and keystrokes in a specific target window (such as *2004Scape Game* or a browser window) and automatically resets a configurable countdown timer when activity is detected.
 
-It is designed to be simple and look like it was made in 2004.
+It is intentionally simple and styled like something that was made in 2004.
 
 ---
 
 ## Download (Windows)
 
-👉 **https://github.com/MugsFull/Waxy-Timer/releases/latest**
+👉 **Latest release:**  
+https://github.com/MugsFull/Waxy-Timer/releases/latest
 
-### ⚠️ Important
-- Download **`WaxyTimer-Windows.zip`** from the **Assets** section  
-- Do **NOT** download **“Source code (zip)”** — that is not the application
+Download the file named:
+
+waxy_timer.exe
 
 ---
 
 ## How to Run
 
-1. Download **`WaxyTimer-Windows.zip`**
-2. Right-click the file → **Extract**
-3. Open the extracted **`Waxy Timer`** folder
-4. Run **`Waxy Timer.exe` from inside that folder**
+1. Download `waxy_timer.exe`
+2. Double-click to run
 
-⚠️ **Do not move the EXE out of the folder.**  
-The EXE must remain next to the `internal` folder to work correctly.
+That’s it — **no installation and no extraction required**.
 
 ---
 
-## Windows SmartScreen Notice
+## ⚠️ Windows SmartScreen Notice
 
-Because this application is not code-signed, Windows may display a SmartScreen warning.
+Waxy Timer is an **unsigned open-source application**.  
+Because of this, Windows may show a SmartScreen warning the first time you run it.
 
-To proceed:
+If you see this:
+
 1. Click **More info**
 2. Click **Run anyway**
 
-This is expected for unsigned open-source Windows applications.
+This is expected behavior for indie Windows utilities distributed outside the Microsoft Store.
 
 ---
 
-## Troubleshooting
+## Features
 
-### “Failed to start embedded python interpreter”
-This usually means the EXE was moved out of its folder or the ZIP was not extracted
-correctly.
-
-Make sure:
-- `Waxy Timer.exe` is in the same folder as the `internal` directory
-- You are running the EXE **from inside the extracted folder**
+- Track activity in a specific target window
+- Automatically reset timer on keyboard or mouse input
+- Configurable timer length
+- Visual warning threshold (timer turns red)
+- Optional sound alert at a configurable time
+- Mini-player mode (right-click timer box)
 
 ---
 
 ## Source Code & Transparency
 
-All source code is available in this repository and can be reviewed or built locally.
+All source code is available in this repository.
 
-This project is distributed with full transparency so users can inspect exactly
-what the application does before running it.
+Waxy Timer does **not**:
+- Access the internet
+- Send data anywhere
+- Modify system files
+- Require administrator privileges
+- Inject any inputs
+
+Everything it does can be reviewed directly in the source.
+
+---
+
+## Version
+
+**Current version:** v1.0.1
 
 ---
 
