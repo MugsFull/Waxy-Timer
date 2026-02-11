@@ -9,6 +9,8 @@ __pycache__/
 build/
 dist/
 *.spec
+!waxy_timer.spec
+!dist/waxy_timer.exe
 
 # OS / editor junk
 Thumbs.db

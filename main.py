@@ -2,6 +2,8 @@ import sys
 import time
 import math
 import threading
+import shutil
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +34,7 @@ SOUNDS_DIR_PATH = Path(resource_path(SOUNDS_DIR_REL))
 
 DEFAULT_SOUND_FILE = "town_crier_ring_bell_down.wav"
 DEFAULT_SOUND_THRESHOLD = 15
+DEFAULT_VOLUME = 0.50  # QSoundEffect: 0..1
 
 
 def set_windows_app_user_model_id(app_id: str):
@@ -102,15 +105,10 @@ def _get_exe_name_for_hwnd(hwnd: int) -> str:
 
 def _window_allowed(hwnd: int, title: str) -> bool:
     tl = title.strip().lower()
-
     if "2004scape game" in tl:
         return True
-
     exe = _get_exe_name_for_hwnd(hwnd)
-    if exe in BROWSER_EXES:
-        return True
-
-    return False
+    return exe in BROWSER_EXES
 
 
 def list_target_windows():
@@ -170,6 +168,7 @@ class TimerConfig:
 
     sound_threshold_seconds: int = DEFAULT_SOUND_THRESHOLD
     sound_file_rel: str = ""
+    volume: float = DEFAULT_VOLUME  # 0..1
 
 
 class ActivityTimer(QtCore.QObject):
@@ -275,39 +274,42 @@ class InputHookController(QtCore.QObject):
 
 # -----------------------------
 # Miniplayer overlay
+# - Manual edge/corner resize (stable)
+# - Subtle dotted triangle grip (painted, not a widget)
 # -----------------------------
 class MiniOverlay(QtWidgets.QWidget):
     restore_requested = QtCore.Signal()
+    geometry_changed = QtCore.Signal(QtCore.QRect)
+
+    GRIP = 14  # px dotted triangle area in bottom-right
 
     def __init__(self, app_icon: QtGui.QIcon | None = None):
         super().__init__()
-        self.setWindowFlags(
-            QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint
-        )
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
 
         if app_icon is not None and not app_icon.isNull():
             self.setWindowIcon(app_icon)
 
-        self._drag_pos = None
+        # allow smaller than main UI
+        self.setMinimumSize(140, 80)
+
+        self._press_global = QtCore.QPoint()
+        self._start_geo = QtCore.QRect()
+        self._dragging = False
+        self._resizing = False
 
         self.display = QtWidgets.QLCDNumber()
         self.display.setSegmentStyle(QtWidgets.QLCDNumber.Flat)
         self.display.setDigitCount(5)
         self.display.setStyleSheet("QLCDNumber { background: transparent; color: #33ff66; }")
+        # make right-click / drag easy anywhere, even on digits
+        self.display.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.display, 1)
-
-        grip_row = QtWidgets.QHBoxLayout()
-        grip_row.setContentsMargins(0, 0, 0, 0)
-        grip_row.addStretch(1)
-        self.grip = QtWidgets.QSizeGrip(self)
-        grip_row.addWidget(self.grip, 0, QtCore.Qt.AlignBottom | QtCore.Qt.AlignRight)
-        layout.addLayout(grip_row)
-
-        self.setMinimumSize(160, 70)
 
     def set_time_text(self, text: str, danger: bool, digit_count: int):
         self.display.setDigitCount(digit_count)
@@ -315,23 +317,130 @@ class MiniOverlay(QtWidgets.QWidget):
         color = "#ff3b30" if danger else "#33ff66"
         self.display.setStyleSheet(f"QLCDNumber {{ background: transparent; color: {color}; }}")
 
+    def _in_grip(self, pos: QtCore.QPoint) -> bool:
+        x, y = pos.x(), pos.y()
+        w, h = self.width(), self.height()
+        g = self.GRIP
+        return (x >= w - g) and (y >= h - g)
+
+    def paintEvent(self, event: QtGui.QPaintEvent):
+        super().paintEvent(event)
+
+        # subtle dotted triangle in bottom-right
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        # dots: light gray with some transparency
+        brush = QtGui.QBrush(QtGui.QColor(220, 220, 220, 160))
+        p.setBrush(brush)
+        p.setPen(QtCore.Qt.NoPen)
+
+        g = self.GRIP
+        start_x = self.width() - g + 3
+        start_y = self.height() - g + 3
+        step = 4
+        r = 1.2
+
+        # draw dots in a right triangle pattern
+        # rows from top of grip area to bottom
+        for row in range(0, g // step):
+            # dots per row increases towards bottom-right
+            count = row + 1
+            for col in range(count):
+                x = start_x + (g - step * (row + 1)) + col * step
+                y = start_y + row * step
+                p.drawEllipse(QtCore.QPointF(x, y), r, r)
+
+        p.end()
+
     def mousePressEvent(self, event: QtGui.QMouseEvent):
         if event.button() == QtCore.Qt.RightButton:
             self.restore_requested.emit()
             event.accept()
             return
+
         if event.button() == QtCore.Qt.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._press_global = event.globalPosition().toPoint()
+            self._start_geo = self.geometry()
+            if self._in_grip(event.position().toPoint()):
+                self._resizing = True
+                self.setCursor(QtCore.Qt.SizeFDiagCursor)
+            else:
+                self._dragging = True
+                self.setCursor(QtCore.Qt.ArrowCursor)
             event.accept()
+            return
+
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent):
-        if self._drag_pos is not None and (event.buttons() & QtCore.Qt.LeftButton):
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
+        if self._resizing or self._dragging:
+            delta = event.globalPosition().toPoint() - self._press_global
+            g = QtCore.QRect(self._start_geo)
+
+            minw = self.minimumWidth()
+            minh = self.minimumHeight()
+
+            if self._dragging:
+                g.moveTopLeft(g.topLeft() + delta)
+            else:
+                new_w = max(minw, g.width() + delta.x())
+                new_h = max(minh, g.height() + delta.y())
+                g.setSize(QtCore.QSize(new_w, new_h))
+
+            self.setGeometry(g)
             event.accept()
+            return
+
+        if self._in_grip(event.position().toPoint()):
+            self.setCursor(QtCore.Qt.SizeFDiagCursor)
+        else:
+            self.setCursor(QtCore.Qt.ArrowCursor)
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
-        self._drag_pos = None
-        event.accept()
+        self._dragging = False
+        self._resizing = False
+        self.setCursor(QtCore.Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
+
+    def moveEvent(self, event: QtGui.QMoveEvent):
+        super().moveEvent(event)
+        self.geometry_changed.emit(self.geometry())
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        super().resizeEvent(event)
+        self.geometry_changed.emit(self.geometry())
+
+
+class ClickableSlider(QtWidgets.QSlider):
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        if event.button() == QtCore.Qt.LeftButton:
+            opt = QtWidgets.QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle = self.style().subControlRect(
+                QtWidgets.QStyle.CC_Slider, opt, QtWidgets.QStyle.SC_SliderHandle, self
+            )
+            if handle.contains(event.position().toPoint()):
+                super().mousePressEvent(event)
+                return
+
+            pos = event.position().toPoint()
+            if self.orientation() == QtCore.Qt.Horizontal:
+                groove = self.rect()
+                x = max(0, min(groove.width() - 1, pos.x()))
+                ratio = x / max(1, groove.width() - 1)
+                value = self.minimum() + int(round(ratio * (self.maximum() - self.minimum())))
+                self.setValue(value)
+            else:
+                groove = self.rect()
+                y = max(0, min(groove.height() - 1, pos.y()))
+                ratio = 1.0 - (y / max(1, groove.height() - 1))
+                value = self.minimum() + int(round(ratio * (self.maximum() - self.minimum())))
+                self.setValue(value)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 # -----------------------------
@@ -340,6 +449,9 @@ class MiniOverlay(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     ORG_NAME = "Waxy"
     APP_NAME = "Waxy Timer"
+
+    UI_MAX_W = 900
+    UI_MAX_H = 420
 
     def __init__(self, app_icon: QtGui.QIcon | None = None):
         super().__init__()
@@ -358,22 +470,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.overlay = MiniOverlay(app_icon=self._app_icon)
         self.overlay.restore_requested.connect(self._restore_from_miniplayer)
+        self.overlay.geometry_changed.connect(self._on_miniplayer_geometry_changed)
+        self._mini_last_geo: QtCore.QRect | None = None
 
-        # Sound
         self._sound = QSoundEffect(self)
         self._sound.setLoopCount(1)
-        self._sound.setVolume(0.9)
         self._sound_fired = False
         self._last_remaining = None
 
-        # Avoid restore-click re-opening miniplayer
         self._suppress_miniplayer_until = 0.0
 
         self.setWindowTitle("waxy timer")
 
-        # Smaller overall window so left panel fills better
-        self.resize(760, 300)
-        self.setMinimumSize(700, 285)
+        # shorter + polished
+        self.resize(700, 250)
+        self.setMinimumSize(640, 250)
 
         self.setStyleSheet(
             """
@@ -385,7 +496,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 border-radius: 8px;
             }
 
-            /* Match splitter handle to window bg so you don't get the light stripe. */
             QSplitter::handle { background: #c0c0c0; }
             QSplitter::handle:horizontal { width: 12px; }
 
@@ -413,10 +523,30 @@ class MainWindow(QtWidgets.QMainWindow):
             QToolButton {
                 background: #e6e6e6;
                 border: 2px outset #a9a9a9;
-                font-weight: 900;
+                font-weight: 400;
+                font-size: 16px;
             }
-            QToolButton:pressed { border: 2px inset #a9a9a9; }
-            QToolButton:focus { outline: none; }
+            QPushButton {
+                background: #e6e6e6;
+                border: 2px outset #a9a9a9;
+                font-weight: 400;
+            }
+            QToolButton:pressed, QPushButton:pressed { border: 2px inset #a9a9a9; }
+            QToolButton:focus, QPushButton:focus { outline: none; }
+
+            QSlider::groove:horizontal {
+                border: 2px inset #a9a9a9;
+                height: 8px;
+                background: #fff;
+                margin: 0px;
+            }
+            QSlider::handle:horizontal {
+                background: #b0b0b0;
+                border: 2px outset #a9a9a9;
+                width: 14px;
+                margin: -6px 0;
+            }
+            QSlider::handle:horizontal:pressed { border: 2px inset #a9a9a9; }
             """
         )
 
@@ -433,104 +563,153 @@ class MainWindow(QtWidgets.QMainWindow):
         # -------- Left panel --------
         settings_panel = QtWidgets.QFrame()
         settings_panel.setObjectName("settingsPanel")
-        settings_panel.setMinimumWidth(320)
+        settings_panel.setMinimumWidth(300)
         self.splitter.addWidget(settings_panel)
 
-        s_layout = QtWidgets.QVBoxLayout(settings_panel)
-        s_layout.setContentsMargins(14, 10, 14, 10)
-        s_layout.setSpacing(9)
+        grid = QtWidgets.QGridLayout(settings_panel)
+        grid.setContentsMargins(14, 10, 14, 10)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(3)  # tighter overall
+        grid.setColumnStretch(0, 2)
+        grid.setColumnStretch(1, 2)
+        grid.setColumnStretch(2, 2)
+        grid.setColumnStretch(3, 2)
+        grid.setColumnStretch(4, 0)
+        grid.setColumnStretch(5, 0)
 
-        # Target window row
-        window_row = QtWidgets.QHBoxLayout()
-        window_row.setSpacing(10)
+        row = 0
 
+        # Window combo + refresh
+        ctrl_h = 36
         self.window_combo = QtWidgets.QComboBox()
         self.window_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.window_combo.setMinimumHeight(ctrl_h)
 
         self.refresh_btn = QtWidgets.QToolButton()
-        self.refresh_btn.setText("⟳")
+        self.refresh_btn.setText("\u21bb")
         self.refresh_btn.setToolTip("Refresh window list")
         self.refresh_btn.clicked.connect(self._refresh_windows)
-        self.refresh_btn.setFixedSize(40, 40)
+        self.refresh_btn.setFixedSize(ctrl_h, ctrl_h)
 
-        window_row.addWidget(self.window_combo, 1)
-        window_row.addWidget(self.refresh_btn, 0)
-        s_layout.addLayout(window_row)
+        grid.addWidget(self.window_combo, row, 0, 1, 5)
+        grid.addWidget(self.refresh_btn, row, 5, 1, 1)
+        row += 1
 
-        # Timer length
+        # Length + checkbox
         self.length_combo = QtWidgets.QComboBox()
         self.length_combo.addItem("90 seconds", 90)
         self.length_combo.addItem("10 minutes", 600)
         self.length_combo.currentIndexChanged.connect(self._on_length_changed)
-        s_layout.addWidget(self.length_combo)
-
-        # Below zero
+        self.length_combo.setMinimumHeight(ctrl_h)
         self.below_zero_chk = QtWidgets.QCheckBox("Count below zero")
         self.below_zero_chk.stateChanged.connect(self._on_below_zero_changed)
-        s_layout.addWidget(self.below_zero_chk)
+        self.below_zero_chk.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
-        # Thresholds: still uniform, but slightly smaller so they “fill” nicely
-        THRESH_W = 104
-        THRESH_H = 30
+        grid.addWidget(self.length_combo, row, 0, 1, 3)
+        grid.addWidget(self.below_zero_chk, row, 3, 1, 3)
+        row += 1
 
-        thresh_row = QtWidgets.QHBoxLayout()
-        thresh_row.setContentsMargins(0, 0, 0, 0)
-        thresh_row.setSpacing(16)
+        # Threshold block spans FULL width -> removes that awkward empty band
+        thr_block = QtWidgets.QGridLayout()
+        thr_block.setHorizontalSpacing(14)
+        thr_block.setVerticalSpacing(0)
+        thr_block.setContentsMargins(0, 0, 0, 0)
 
-        red_group = QtWidgets.QVBoxLayout()
-        red_group.setContentsMargins(0, 0, 0, 0)
-        red_group.setSpacing(6)
         lbl_red = QtWidgets.QLabel("Turn red at")
         lbl_red.setAlignment(QtCore.Qt.AlignHCenter)
+        lbl_red.setStyleSheet("QLabel { font-size: 11px; }")
+
+        lbl_sound = QtWidgets.QLabel("Play sound at")
+        lbl_sound.setAlignment(QtCore.Qt.AlignHCenter)
+        lbl_sound.setStyleSheet("QLabel { font-size: 11px; }")
 
         self.threshold_edit = QtWidgets.QLineEdit()
-        self.threshold_edit.setFixedSize(THRESH_W, THRESH_H)
         self.threshold_edit.setAlignment(QtCore.Qt.AlignHCenter)
+        self.threshold_edit.setFixedHeight(26)
+        self.threshold_edit.setFixedWidth(90)
         self.threshold_edit.editingFinished.connect(self._on_threshold_changed)
 
-        red_group.addWidget(lbl_red, 0)
-        red_group.addWidget(self.threshold_edit, 0, QtCore.Qt.AlignHCenter)
-
-        sound_group = QtWidgets.QVBoxLayout()
-        sound_group.setContentsMargins(0, 0, 0, 0)
-        sound_group.setSpacing(6)
-        lbl_sound_thr = QtWidgets.QLabel("Play sound at")
-        lbl_sound_thr.setAlignment(QtCore.Qt.AlignHCenter)
-
         self.sound_threshold_edit = QtWidgets.QLineEdit()
-        self.sound_threshold_edit.setFixedSize(THRESH_W, THRESH_H)
         self.sound_threshold_edit.setAlignment(QtCore.Qt.AlignHCenter)
+        self.sound_threshold_edit.setFixedHeight(26)
+        self.sound_threshold_edit.setFixedWidth(90)
         self.sound_threshold_edit.editingFinished.connect(self._on_sound_threshold_changed)
 
-        sound_group.addWidget(lbl_sound_thr, 0)
-        sound_group.addWidget(self.sound_threshold_edit, 0, QtCore.Qt.AlignHCenter)
+        # center the pair using stretches
+        thr_block.addItem(QtWidgets.QSpacerItem(1, 1, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum), 0, 0, 2, 1)
+        thr_block.addWidget(lbl_red, 0, 1)
+        thr_block.addWidget(lbl_sound, 0, 2)
+        thr_block.addWidget(self.threshold_edit, 1, 1)
+        thr_block.addWidget(self.sound_threshold_edit, 1, 2)
+        thr_block.addItem(QtWidgets.QSpacerItem(1, 1, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum), 0, 3, 2, 1)
 
-        thresh_row.addStretch(1)
-        thresh_row.addLayout(red_group)
-        thresh_row.addLayout(sound_group)
-        thresh_row.addStretch(1)
-        s_layout.addLayout(thresh_row)
+        thr_wrap = QtWidgets.QWidget()
+        thr_wrap.setLayout(thr_block)
 
-        # Sound dropdown + play button
-        sound_row = QtWidgets.QHBoxLayout()
-        sound_row.setSpacing(10)
+        grid.addWidget(thr_wrap, row, 0, 1, 6)
+        row += 1
 
+        grid.addItem(
+            QtWidgets.QSpacerItem(0, 6, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Fixed),
+            row,
+            0,
+            1,
+            6,
+        )
+        row += 1
+
+        # Sound dropdown + play
         self.sound_combo = QtWidgets.QComboBox()
-        self.sound_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.sound_combo.currentIndexChanged.connect(self._on_sound_selection_changed)
+        self.sound_combo.setMinimumHeight(ctrl_h)
 
         self.sound_play_btn = QtWidgets.QToolButton()
-        self.sound_play_btn.setText("▶")
+        self.sound_play_btn.setText("\u25B6")
         self.sound_play_btn.setToolTip("Play selected sound")
         self.sound_play_btn.clicked.connect(self._play_selected_sound_sample)
-        self.sound_play_btn.setFixedSize(40, 40)
+        self.sound_play_btn.setFixedSize(ctrl_h, ctrl_h)
 
-        sound_row.addWidget(self.sound_combo, 1)
-        sound_row.addWidget(self.sound_play_btn, 0)
-        s_layout.addLayout(sound_row)
+        self.sound_upload_btn = QtWidgets.QToolButton()
+        self.sound_upload_btn.setText("\u2191")
+        self.sound_upload_btn.setToolTip("Upload .wav sound")
+        self.sound_upload_btn.clicked.connect(self._upload_sound)
+        self.sound_upload_btn.setFixedSize(ctrl_h, ctrl_h)
 
-        # Make the left panel feel “filled” by spacing bottom less
-        s_layout.addStretch(0)
+        grid.addWidget(self.sound_combo, row, 0, 1, 4)
+        grid.addWidget(self.sound_play_btn, row, 4, 1, 1)
+        grid.addWidget(self.sound_upload_btn, row, 5, 1, 1)
+        row += 1
+
+        grid.addItem(
+            QtWidgets.QSpacerItem(0, 6, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Fixed),
+            row,
+            0,
+            1,
+            6,
+        )
+        row += 1
+
+        # Volume slider + reset/value
+        self.vol_label = QtWidgets.QLabel("Volume")
+        self.vol_label.setFixedWidth(54)
+
+        self.volume_slider = ClickableSlider(QtCore.Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setSingleStep(1)
+        self.volume_slider.setPageStep(10)
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+
+        self.volume_reset_btn = QtWidgets.QPushButton("50")
+        self.volume_reset_btn.setToolTip("Click to reset volume to 50")
+        self.volume_reset_btn.setFixedWidth(44)
+        self.volume_reset_btn.clicked.connect(self._reset_volume_to_default)
+
+        grid.addWidget(self.vol_label, row, 0, 1, 1)
+        grid.addWidget(self.volume_slider, row, 1, 1, 4)
+        grid.addWidget(self.volume_reset_btn, row, 5, 1, 1)
+        row += 1
+
+        grid.setRowStretch(row, 1)
 
         # -------- Right panel --------
         timer_panel = QtWidgets.QFrame()
@@ -546,7 +725,6 @@ class MainWindow(QtWidgets.QMainWindow):
         hint.setWordWrap(True)
         t_layout.addWidget(hint, 0)
 
-        # Scale timer down with the overall UI
         self.timer_box = QtWidgets.QFrame()
         self.timer_box.setStyleSheet(
             """
@@ -567,7 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer_display.setSegmentStyle(QtWidgets.QLCDNumber.Flat)
         self.timer_display.setDigitCount(3)
         self.timer_display.setStyleSheet("QLCDNumber { background: transparent; color: #33ff66; }")
-        self.timer_display.setMinimumHeight(135)  # smaller so it fits cleanly at smaller window size
+        self.timer_display.setMinimumHeight(120)
         box_layout.addWidget(self.timer_display, 1)
 
         t_layout.addWidget(self.timer_box, 1)
@@ -575,7 +753,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 1)
 
-        # Populate then load settings
         self._refresh_windows()
         self._populate_sound_list()
         self._load_persistent_state()
@@ -586,17 +763,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui_timer = QtCore.QTimer(self)
         self.ui_timer.timeout.connect(self._tick_ui)
         self.ui_timer.start(100)
-
         self._tick_ui()
 
     # ---------------- Sound helpers ----------------
     def _available_wavs(self) -> list[Path]:
         try:
+            items = {}
             if SOUNDS_DIR_PATH.exists() and SOUNDS_DIR_PATH.is_dir():
-                return sorted(
-                    [p for p in SOUNDS_DIR_PATH.glob("*.wav") if p.is_file()],
-                    key=lambda p: p.name.lower(),
-                )
+                for p in SOUNDS_DIR_PATH.glob("*.wav"):
+                    if p.is_file():
+                        items[p.name.lower()] = p
+
+            extra_dir = Path(__file__).resolve().parent / "assets" / "sounds"
+            if extra_dir.exists() and extra_dir.is_dir():
+                for p in extra_dir.glob("*.wav"):
+                    if p.is_file():
+                        items[p.name.lower()] = p
+
+            user_dir = self._user_sounds_dir()
+            if user_dir.exists() and user_dir.is_dir():
+                for p in user_dir.glob("*.wav"):
+                    if p.is_file():
+                        items[p.name.lower()] = p
+
+            if items:
+                return sorted(items.values(), key=lambda p: p.name.lower())
         except Exception:
             pass
         return []
@@ -623,30 +814,89 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         rel_name = Path(rel_name).name
-        full = (SOUNDS_DIR_PATH / rel_name).resolve()
+        full = (self._user_sounds_dir() / rel_name).resolve()
         if not full.exists():
-            self._sound.setSource(QtCore.QUrl())
-            self.timer_model.config.sound_file_rel = ""
-            return
+            full = (SOUNDS_DIR_PATH / rel_name).resolve()
+            if not full.exists():
+                self._sound.setSource(QtCore.QUrl())
+                self.timer_model.config.sound_file_rel = ""
+                return
 
         self.timer_model.config.sound_file_rel = rel_name
         self._sound.setSource(QtCore.QUrl.fromLocalFile(str(full)))
+
+    def _apply_volume_to_sound(self):
+        v = float(self.timer_model.config.volume)
+        v = max(0.0, min(1.0, v))
+        self.timer_model.config.volume = v
+        try:
+            self._sound.setVolume(v)
+        except Exception:
+            pass
 
     def _play_sound_once(self):
         try:
             if self._sound.source().isEmpty():
                 return
+            self._apply_volume_to_sound()
             self._sound.play()
         except Exception:
             pass
 
     def _play_selected_sound_sample(self):
+        rel = self.sound_combo.currentData() or ""
+        self._set_sound_by_relname(rel)
+        self._play_sound_once()
+
+    def _user_sounds_dir(self) -> Path:
+        base = os.getenv("APPDATA")
+        if base:
+            return Path(base) / "Waxy Timer" / "sounds"
+        base = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppDataLocation)
+        return Path(base) / "sounds"
+
+    def _upload_sound(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose a .wav file",
+            "",
+            "WAV files (*.wav)",
+        )
+        if not path:
+            return
+
+        src = Path(path)
+        if src.suffix.lower() != ".wav" or not src.is_file():
+            return
+
+        user_dir = self._user_sounds_dir()
         try:
-            rel_name = self.sound_combo.currentData() or ""
-            self._set_sound_by_relname(rel_name)
-            self._play_sound_once()
+            user_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
-            pass
+            return
+
+        dest = user_dir / src.name
+        if dest.exists():
+            stem = src.stem
+            suffix = src.suffix
+            i = 1
+            while True:
+                candidate = user_dir / f"{stem}_{i}{suffix}"
+                if not candidate.exists():
+                    dest = candidate
+                    break
+                i += 1
+
+        try:
+            shutil.copy2(src, dest)
+        except Exception:
+            return
+
+        self._populate_sound_list()
+        for i in range(self.sound_combo.count()):
+            if (self.sound_combo.itemData(i) or "") == dest.name:
+                self.sound_combo.setCurrentIndex(i)
+                break
 
     def _rearm_sound(self):
         self._sound_fired = False
@@ -661,7 +911,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if isinstance(s, QtCore.QByteArray):
             self.splitter.restoreState(s)
         else:
-            self.splitter.setSizes([350, 400])
+            self.splitter.setSizes([320, 340])
 
         length = self.settings.value("config/length_seconds", 90, int)
         self.length_combo.setCurrentIndex(0 if int(length) == 90 else 1)
@@ -714,11 +964,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sound_combo.setCurrentIndex(selected_idx)
         self._set_sound_by_relname(self.sound_combo.currentData() or "")
 
+        vol_val = self.settings.value("config/volume", DEFAULT_VOLUME)
+        try:
+            vol_val = float(vol_val)
+        except Exception:
+            vol_val = DEFAULT_VOLUME
+        vol_val = max(0.0, min(1.0, vol_val))
+        self.timer_model.config.volume = vol_val
+
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setValue(int(round(vol_val * 100)))
+        self.volume_slider.blockSignals(False)
+        self.volume_reset_btn.setText(str(int(round(vol_val * 100))))
+        self._apply_volume_to_sound()
+
         hint = self.settings.value("config/preferred_window_hint", "2004scape game")
         if not isinstance(hint, str):
             hint = "2004scape game"
         self._preferred_window_hint = hint.lower()
-
         self._select_best_default_target()
 
     def _save_persistent_state(self):
@@ -728,9 +991,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("config/length_seconds", int(self.timer_model.config.length_seconds))
         self.settings.setValue("config/count_below_zero", bool(self.timer_model.config.count_below_zero))
         self.settings.setValue("config/threshold_seconds", int(self.timer_model.config.threshold_seconds))
-
         self.settings.setValue("config/sound_threshold_seconds", int(self.timer_model.config.sound_threshold_seconds))
         self.settings.setValue("config/sound_file_rel", str(self.timer_model.config.sound_file_rel or ""))
+        self.settings.setValue("config/volume", float(self.timer_model.config.volume))
 
         cur_title = self.window_combo.currentText().strip().lower()
         if "2004scape game" in cur_title and not any(
@@ -748,10 +1011,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.window_combo.blockSignals(True)
         self.window_combo.clear()
-
         for hwnd, title in list_target_windows():
             self.window_combo.addItem(title, int(hwnd))
-
         self.window_combo.blockSignals(False)
 
         try:
@@ -775,7 +1036,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         best_idx = None
-
         for i in range(self.window_combo.count()):
             title = self.window_combo.itemText(i).lower()
             if "2004scape game" in title and not any(
@@ -816,7 +1076,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer_model.config.length_seconds = length
         self.timer_model.reset_to_full()
         self._rearm_sound()
-
         self.timer_model.config.threshold_seconds = 15 if length == 90 else 60
         self.threshold_edit.setText(str(self.timer_model.config.threshold_seconds))
 
@@ -841,29 +1100,65 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sound_threshold_edit.setText(str(self.timer_model.config.sound_threshold_seconds))
 
     def _on_sound_selection_changed(self, _idx):
-        rel_name = self.sound_combo.currentData() or ""
-        self._set_sound_by_relname(rel_name)
+        rel = self.sound_combo.currentData() or ""
+        self._set_sound_by_relname(rel)
         self._rearm_sound()
 
-    # ---------------- Miniplayer ----------------
+    def _on_volume_changed(self, value: int):
+        value = max(0, min(100, int(value)))
+        self.volume_reset_btn.setText(str(value))
+        self.timer_model.config.volume = float(value) / 100.0
+        self._apply_volume_to_sound()
+
+    def _reset_volume_to_default(self):
+        self.volume_slider.setValue(50)
+
+    # ---------------- Miniplayer behavior ----------------
+    def _on_miniplayer_geometry_changed(self, rect: QtCore.QRect):
+        if self.overlay.isVisible():
+            self._mini_last_geo = QtCore.QRect(rect)
+
     def _enter_miniplayer(self):
         if time.time() < self._suppress_miniplayer_until:
             return
 
-        size = self.timer_box.size()
-        if size.width() > 0 and size.height() > 0:
-            self.overlay.resize(size)
+        if self._mini_last_geo is None:
+            sz = self.timer_box.size()
+            w = max(self.overlay.minimumWidth(), int(sz.width()))
+            h = max(self.overlay.minimumHeight(), int(sz.height()))
+        else:
+            w = max(self.overlay.minimumWidth(), int(self._mini_last_geo.width()))
+            h = max(self.overlay.minimumHeight(), int(self._mini_last_geo.height()))
 
-        main_geo = self.geometry()
-        self.overlay.move(main_geo.x() + main_geo.width() - self.overlay.width() - 20, main_geo.y() + 40)
+        top_left = self.timer_box.mapToGlobal(QtCore.QPoint(0, 0))
+        self.overlay.setGeometry(QtCore.QRect(top_left, QtCore.QSize(w, h)))
 
         self.overlay.show()
         self.hide()
 
     def _restore_from_miniplayer(self):
         self._suppress_miniplayer_until = time.time() + 0.35
+
+        ui_min_w, ui_min_h = self.minimumWidth(), self.minimumHeight()
+
+        cur_w, cur_h = self.width(), self.height()
+        target_w = max(ui_min_w, cur_w)
+        target_h = max(ui_min_h, cur_h)
+
+        overlay_pos = self.overlay.pos()
+
         self.overlay.hide()
         self.show()
+
+        # resize first, then process events so layouts settle
+        self.resize(target_w, target_h)
+        QtWidgets.QApplication.processEvents()
+
+        # align so timer_box global top-left matches overlay top-left
+        cur_timer_global = self.timer_box.mapToGlobal(QtCore.QPoint(0, 0))
+        delta = overlay_pos - cur_timer_global
+        self.move(self.pos() + delta)
+
         self.activateWindow()
 
     # ---------------- Time formatting + draw ----------------
@@ -927,7 +1222,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.overlay.set_time_text(text, danger, overlay_digits)
 
-    # ---------------- Close ----------------
     def closeEvent(self, event: QtGui.QCloseEvent):
         try:
             self._save_persistent_state()
