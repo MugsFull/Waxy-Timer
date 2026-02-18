@@ -107,6 +107,8 @@ def _window_allowed(hwnd: int, title: str) -> bool:
     tl = title.strip().lower()
     if "2004scape game" in tl:
         return True
+    if "lostkit" in tl:
+        return True
     exe = _get_exe_name_for_hwnd(hwnd)
     return exe in BROWSER_EXES
 
@@ -950,7 +952,11 @@ class MainWindow(QtWidgets.QMainWindow):
             saved_sound_file = ""
         saved_sound_file = saved_sound_file.strip()
 
-        if not has_saved_sound:
+        has_sound_selection = self.settings.value("config/has_sound_selection", False)
+        if isinstance(has_sound_selection, str):
+            has_sound_selection = has_sound_selection.strip().lower() in ("1", "true", "yes", "on")
+
+        if (not has_saved_sound or not has_sound_selection) and not saved_sound_file:
             if (SOUNDS_DIR_PATH / DEFAULT_SOUND_FILE).exists():
                 saved_sound_file = DEFAULT_SOUND_FILE
             else:
@@ -993,6 +999,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("config/threshold_seconds", int(self.timer_model.config.threshold_seconds))
         self.settings.setValue("config/sound_threshold_seconds", int(self.timer_model.config.sound_threshold_seconds))
         self.settings.setValue("config/sound_file_rel", str(self.timer_model.config.sound_file_rel or ""))
+        self.settings.setValue("config/has_sound_selection", True)
         self.settings.setValue("config/volume", float(self.timer_model.config.volume))
 
         cur_title = self.window_combo.currentText().strip().lower()
@@ -1043,6 +1050,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ):
                 best_idx = i
                 break
+
+        if best_idx is None:
+            for i in range(self.window_combo.count()):
+                title = self.window_combo.itemText(i).lower()
+                if "lostkit" in title:
+                    best_idx = i
+                    break
 
         if best_idx is None and getattr(self, "_preferred_window_hint", ""):
             hint = self._preferred_window_hint
