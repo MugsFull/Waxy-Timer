@@ -1,10 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets', 'assets')],
+    datas=[('assets\\sounds', 'assets\\sounds'), ('assets\\waxy.ico', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

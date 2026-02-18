@@ -107,6 +107,8 @@ def _window_allowed(hwnd: int, title: str) -> bool:
     tl = title.strip().lower()
     if "2004scape game" in tl:
         return True
+    if "lostkit" in tl:
+        return True
     exe = _get_exe_name_for_hwnd(hwnd)
     return exe in BROWSER_EXES
 
@@ -1043,6 +1045,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ):
                 best_idx = i
                 break
+
+        if best_idx is None:
+            for i in range(self.window_combo.count()):
+                title = self.window_combo.itemText(i).lower()
+                if "lostkit" in title:
+                    best_idx = i
+                    break
 
         if best_idx is None and getattr(self, "_preferred_window_hint", ""):
             hint = self._preferred_window_hint
