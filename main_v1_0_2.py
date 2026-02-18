@@ -1,3 +1,4 @@
+# Preserved historical version of main.py (v1.0.2); not used by the app at runtime.
 import sys
 import time
 import math
