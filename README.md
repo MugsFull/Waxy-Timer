@@ -68,7 +68,7 @@ Everything it does can be reviewed directly in the source.
 
 ## Version
 
-**Current version:** v1.0.2
+**Current version:** v1.0.3
 
 ---
 
